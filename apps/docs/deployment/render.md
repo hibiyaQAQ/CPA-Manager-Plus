@@ -28,8 +28,20 @@
 1. 在 [Supabase](https://supabase.com/) 创建一个免费项目。
 2. 进入 Project Settings -> Database -> **Connection pooling**，选择 **Session** 模式，复制连接串。
 
-   **不要用 Transaction 模式。** CPA 的 Postgres 驱动会自动缓存预编译语句（prepared statement）；Transaction 模式的连接池会把同一个逻辑连接的不同请求转发到不同的后端数据库连接上，导致驱动缓存的预编译语句在错误的连接上冲突，报类似 `prepared statement "stmtcache_..." already exists (SQLSTATE 42P05)` 的错误，启动直接失败。Session 模式下每个连接固定绑在同一个后端连接上，行为跟直连一致，不会有这个问题；对本方案只有一个 Render 实例连接的场景，Session 模式完全够用。
-3. 把连接串里的密码占位符替换成你在创建项目时设置的数据库密码，得到完整 DSN，先记下来（下一步要填进 Render）。
+   **不要用 Transaction 模式。** CPA 的 Postgres 驱动（pgx）会自动缓存预编译语句（prepared statement）；连接池只要在背后复用同一个物理数据库连接、又没有清干净上一次的预编译状态，就会报类似 `prepared statement "stmtcache_..." already exists (SQLSTATE 42P05)` 的错误，启动直接失败。Transaction 模式必然会触发这个问题；Session 模式风险小很多，但 Supabase 的连接池实现仍然可能复用背后连接，所以光换 Session 模式不一定彻底解决——保险起见还要加下面这个 DSN 参数。
+3. 在连接串末尾加上查询参数，彻底关掉驱动的服务端预编译语句缓存（根治办法，不管连接池是什么模式都不会再冲突）：
+
+   ```text
+   ?default_query_exec_mode=simple_protocol
+   ```
+
+   如果连接串里已经带了别的参数（比如 `?sslmode=require`），用 `&` 接上去而不是再写一个 `?`。
+
+4. 把连接串里的密码占位符替换成你在创建项目时设置的数据库密码，得到完整 DSN，先记下来（下一步要填进 Render）。最终大概长这样：
+
+   ```text
+   postgresql://postgres.xxxx:密码@aws-xxx.pooler.supabase.com:5432/postgres?default_query_exec_mode=simple_protocol
+   ```
 
 ## 第二步：把 CPA 部署到 Render
 
@@ -137,7 +149,7 @@ Render 只把 CPA 的 `8317` 端口暴露到公网；CPA 在登录流程中用�
 
 ## 常见问题
 
-- **Logs 里报 `failed to bootstrap postgres-backed config` / `prepared statement "stmtcache_..." already exists (SQLSTATE 42P05)`** — 说明 `PGSTORE_DSN` 用的是 Supabase 的 **Transaction** 连接池模式，跟驱动的预编译语句缓存不兼容。回 Supabase 把连接池模式换成 **Session**，更新 Render 的 `PGSTORE_DSN` 环境变量并重启服务，见[第一步](#第一步-创建-supabase-postgres)。这个报错发生在读库阶段，不会破坏你已经写进 `config_store` 的配置。
+- **Logs 里报 `failed to bootstrap postgres-backed config` / `prepared statement "stmtcache_..." already exists (SQLSTATE 42P05)`** — 驱动的预编译语句缓存跟连接池冲突。确认 `PGSTORE_DSN` 用的是 **Session** 连接池模式，并且末尾带上了 `?default_query_exec_mode=simple_protocol`（已有其他参数就用 `&` 接）。只换 Session 模式不一定够，这个 DSN 参数才是根治，两个一起用最保险。改完更新 Render 的 `PGSTORE_DSN` 环境变量并重启，见[第一步](#第一步-创建-supabase-postgres)。这个报错发生在读库阶段，不会破坏你已经写进 `config_store` 的配置。
 - **面板打不开** — 确认 `secret-key` 非空、`disable-control-panel: false`，并且服务确实已经重启过、日志里没有配置解析错误。
 - **连接 Supabase 失败 / 启动报数据库错误（非上面那条 42P05）** — 确认 `PGSTORE_DSN` 密码正确、Supabase 项目没有处于 Paused 状态。
 - **`config_store` 表里内容一直是默认模板，没有变成你写的值** — 确认[第三步](#第三步-配置-config-yaml)里的 SQL 真的执行成功了（用 `select` 语句确认），并且是在 Render 重启 *之后* 检查（重启前本来就该是你刚写的内容，重启后才会变成 CPA 读回来又原样写回的状态）。

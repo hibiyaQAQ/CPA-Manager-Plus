@@ -16,11 +16,12 @@
 #   runtime / image / envVars 等字段名；如有出入，优先用 Render Dashboard
 #   手动创建一个 Web Service，字段含义不会变。
 # - PGSTORE_DSN 必须手动在 Render Dashboard 里填写（Supabase 项目的 Postgres
-#   连接串），不要把它明文写进这个仓库或提交到 Git。必须用 Supabase 的
-#   "Session" 连接池模式，不要用 "Transaction" 模式：CPA 的 Postgres 驱动
-#   会缓存预编译语句，Transaction 模式的连接池会把请求路由到不同的后端
-#   连接上，导致启动报 `prepared statement "stmtcache_..." already exists
-#   (SQLSTATE 42P05)` 而失败。
+#   连接串），不要把它明文写进这个仓库或提交到 Git。用 Supabase 的
+#   "Session" 连接池模式（不要用 "Transaction"），并且连接串末尾要带上
+#   ?default_query_exec_mode=simple_protocol（已有其他参数用 & 接）：
+#   CPA 的 Postgres 驱动会缓存预编译语句，连接池只要复用了背后连接就可能
+#   冲突，报 `prepared statement "stmtcache_..." already exists
+#   (SQLSTATE 42P05)`。光换 Session 模式不一定够，这个参数才是根治。
 # - region 默认写的 singapore，按你自己的用户所在地调整
 #   （oregon / ohio / virginia / frankfurt / singapore）。
 # - 完整部署步骤、config.yaml 示例、Supabase 建库步骤见

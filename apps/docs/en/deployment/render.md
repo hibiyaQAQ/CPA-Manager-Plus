@@ -28,8 +28,20 @@ The [`render.yaml`](https://github.com/seakee/CPA-Manager-Plus/blob/main/render.
 1. Create a free project on [Supabase](https://supabase.com/).
 2. Go to Project Settings -> Database -> **Connection pooling**, pick **Session** mode, and copy the connection string.
 
-   **Do not use Transaction mode.** CPA's Postgres driver caches prepared statements. Transaction-mode pooling can route different requests on the same logical connection to different backend Postgres connections, which collides with that cache and fails startup with something like `prepared statement "stmtcache_..." already exists (SQLSTATE 42P05)`. Session mode pins each connection to one backend connection for its lifetime, behaving like a direct connection, so it doesn't hit this problem — and for this setup's single Render instance, Session mode is plenty.
-3. Replace the password placeholder in the connection string with the database password you set when creating the project, and keep the full DSN handy — you'll paste it into Render next.
+   **Do not use Transaction mode.** CPA's Postgres driver (pgx) caches prepared statements; if the pooler reuses the same physical backend connection without clearing that state, you get errors like `prepared statement "stmtcache_..." already exists (SQLSTATE 42P05)` and startup fails. Transaction mode will reliably trigger this. Session mode is much safer, but Supabase's pooler can still reuse backend connections under the hood, so Session mode alone isn't guaranteed to fix it — add the DSN parameter below as well, just to be safe.
+3. Append a query parameter to the connection string that disables the driver's server-side prepared-statement cache entirely (the actual root-cause fix — safe regardless of pooling mode):
+
+   ```text
+   ?default_query_exec_mode=simple_protocol
+   ```
+
+   If the connection string already has other parameters (e.g. `?sslmode=require`), chain it with `&` instead of adding another `?`.
+
+4. Replace the password placeholder in the connection string with the database password you set when creating the project, and keep the full DSN handy — you'll paste it into Render next. It should end up looking like:
+
+   ```text
+   postgresql://postgres.xxxx:password@aws-xxx.pooler.supabase.com:5432/postgres?default_query_exec_mode=simple_protocol
+   ```
 
 ## Step 2: Deploy CPA On Render
 
@@ -137,7 +149,7 @@ See [OAuth Login](../manual/oauth.md) for details. Vertex service account import
 
 ## Troubleshooting
 
-- **Logs show `failed to bootstrap postgres-backed config` / `prepared statement "stmtcache_..." already exists (SQLSTATE 42P05)`** — `PGSTORE_DSN` is using Supabase's **Transaction** pooling mode, which is incompatible with the driver's prepared-statement cache. Switch the pooling mode to **Session** in Supabase, update the `PGSTORE_DSN` env var on Render, and restart — see [Step 1](#step-1-create-a-supabase-postgres-database). This error happens while reading the database and doesn't damage anything you already wrote into `config_store`.
+- **Logs show `failed to bootstrap postgres-backed config` / `prepared statement "stmtcache_..." already exists (SQLSTATE 42P05)`** — the driver's prepared-statement cache is colliding with the pooler. Confirm `PGSTORE_DSN` uses **Session** pooling mode AND ends with `?default_query_exec_mode=simple_protocol` (chain with `&` if there are already other params). Session mode alone isn't always enough — this DSN parameter is the actual fix, so use both together. Update the `PGSTORE_DSN` env var on Render and restart — see [Step 1](#step-1-create-a-supabase-postgres-database). This error happens while reading the database and doesn't damage anything you already wrote into `config_store`.
 - **The panel won't open** — confirm `secret-key` is non-empty, `disable-control-panel: false`, the service actually restarted, and the logs show no config parsing errors.
 - **Can't connect to Supabase / startup shows a database error (not the 42P05 one above)** — confirm the password in `PGSTORE_DSN` is correct and the Supabase project isn't Paused.
 - **`config_store` still shows the default template, not what you wrote** — confirm the SQL in [Step 3](#step-3-configure-config-yaml) actually ran successfully (check with the `select` query), and that you're checking *after* a Render restart rather than before.
