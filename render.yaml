@@ -1,0 +1,57 @@
+# Render Blueprint: CPA (CLIProxyAPI 本体) 独立部署，完全免费方案
+#
+# 架构：只部署 CPA 一个服务，用 CPA 自带的 PGSTORE（Postgres 远程存储）把
+# config.yaml 和账号认证 token 存进 Supabase 免费 Postgres，本地磁盘只是
+# 一次性/可丢弃的缓存——因此不需要 Render 的付费 Disk，可以用 Free 实例。
+#
+# 面板用的是 CPAMP“轻量面板”：不部署 Manager Server / CPAMP 容器，只在
+# CPA 的 config.yaml 里设置 panel-github-repository，由 CPA 直接在
+# :8317/management.html 托管管理界面。没有请求历史、用量分析和账号自动化，
+# 只做 Provider / 凭证 / OAuth / 日志 / 插件这些日常管理。
+# 如果以后想要完整模式，需要另外部署 CPAMP Manager Server 并挂一个付费
+# Disk（本仓库的 SQLite 存储没有等价的免费方案），不在本文件范围内。
+#
+# 使用前必读：
+# - Render Blueprint 字段会随产品迭代变化，部署前请对照 Render 当前文档核对
+#   runtime / image / envVars 等字段名；如有出入，优先用 Render Dashboard
+#   手动创建一个 Web Service，字段含义不会变。
+# - PGSTORE_DSN 必须手动在 Render Dashboard 里填写（Supabase 项目的 Postgres
+#   连接串，推荐用 Supabase 的 "Transaction pooler" 连接串，而不是直连），
+#   不要把它明文写进这个仓库或提交到 Git。
+# - region 默认写的 singapore，按你自己的用户所在地调整
+#   （oregon / ohio / virginia / frankfurt / singapore）。
+# - 完整部署步骤、config.yaml 示例、Supabase 建库步骤见
+#   apps/docs/deployment/render.md（中文）或 apps/docs/en/deployment/render.md（English）。
+
+services:
+  # CPA / CLIProxyAPI 本体：真实模型网关 + 轻量面板，
+  # Codex / Claude Code 等客户端和管理员浏览器都直接连接这里。
+  - type: web
+    name: cli-proxy-api
+    runtime: image
+    image:
+      url: docker.io/eceasy/cli-proxy-api:latest
+    plan: free
+    region: singapore
+    envVars:
+      - key: PORT
+        value: '8317'
+      - key: TZ
+        value: Asia/Shanghai
+      # 必填：Supabase 项目的 Postgres 连接串（建议用 Transaction pooler，
+      # 端口通常是 6543，并带 ?sslmode=require）。sync: false 表示这个值
+      # 只能在 Render Dashboard 里手动填写，不会出现在这个文件里。
+      - key: PGSTORE_DSN
+        sync: false
+      # 可选：自定义 Postgres schema，不填则用 Supabase 默认的 public。
+      # - key: PGSTORE_SCHEMA
+      #   value: cpa
+    # 首次部署后没有 config.yaml 也没关系：CPA 会用内置的
+    # config.example.yaml 作为模板，把初始配置写进 Supabase。之后打开
+    # Render 的 Shell，编辑本地镜像出来的 config.yaml（保存后会自动同步回
+    # Supabase），至少设置：
+    #   remote-management.secret-key / allow-remote: true /
+    #   disable-control-panel: false /
+    #   panel-github-repository: https://github.com/seakee/CPA-Manager-Plus
+    #   usage-statistics-enabled 不需要开（轻量面板不消费用量队列）
+    #   api-keys: 给真实客户端用的 Key
