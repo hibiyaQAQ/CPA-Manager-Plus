@@ -59,6 +59,7 @@ const zhSidebar: DefaultTheme.Sidebar = [
     items: [
       { text: 'CPAMP 与 CPA 如何协作', link: '/guide/runtime-model' },
       { text: 'Docker 手动部署', link: '/deployment/docker' },
+      { text: 'Render 部署', link: '/deployment/render' },
       { text: '原生包部署', link: '/deployment/native' },
       { text: '原生包后台控制', link: '/deployment/native-background-control' },
       { text: '反向代理', link: '/deployment/reverse-proxy' },
@@ -128,6 +129,7 @@ const enSidebar: DefaultTheme.Sidebar = [
     items: [
       { text: 'How CPAMP Works With CPA', link: '/en/guide/runtime-model' },
       { text: 'Manual Docker Deployment', link: '/en/deployment/docker' },
+      { text: 'Render Deployment', link: '/en/deployment/render' },
       { text: 'Native Packages', link: '/en/deployment/native' },
       { text: 'Native Background Control', link: '/en/deployment/native-background-control' },
       { text: 'Reverse Proxy', link: '/en/deployment/reverse-proxy' },
