@@ -26,10 +26,10 @@
 ## 第一步：创建 Supabase Postgres
 
 1. 在 [Supabase](https://supabase.com/) 创建一个免费项目。
-2. 进入 Project Settings -> Database -> **Connection pooling**，选择 **Transaction** 模式，复制连接串（形如 `postgresql://postgres.xxxx:[YOUR-PASSWORD]@aws-xxx.pooler.supabase.com:6543/postgres`）。
+2. 进入 Project Settings -> Database -> **Connection pooling**，选择 **Session** 模式，复制连接串。
 
-   推荐用连接池（端口通常是 `6543`）而不是直连（端口 `5432`）：Render Free 实例反复冷启动、反复建立新连接，连接池能避免占满 Supabase 免费项目有限的连接数。
-3. 把 `[YOUR-PASSWORD]` 替换成你在创建项目时设置的数据库密码，得到完整 DSN，先记下来（下一步要填进 Render）。
+   **不要用 Transaction 模式。** CPA 的 Postgres 驱动会自动缓存预编译语句（prepared statement）；Transaction 模式的连接池会把同一个逻辑连接的不同请求转发到不同的后端数据库连接上，导致驱动缓存的预编译语句在错误的连接上冲突，报类似 `prepared statement "stmtcache_..." already exists (SQLSTATE 42P05)` 的错误，启动直接失败。Session 模式下每个连接固定绑在同一个后端连接上，行为跟直连一致，不会有这个问题；对本方案只有一个 Render 实例连接的场景，Session 模式完全够用。
+3. 把连接串里的密码占位符替换成你在创建项目时设置的数据库密码，得到完整 DSN，先记下来（下一步要填进 Render）。
 
 ## 第二步：把 CPA 部署到 Render
 
@@ -54,21 +54,57 @@
 
 ## 第三步：配置 config.yaml
 
-打开该服务的 **Shell** 标签，编辑本地镜像出来的配置文件（路径见镜像里的 `config.yaml`，通常在 `/CLIProxyAPI/config.yaml`），至少设置：
+Render 的交互式 **Shell** 是付费实例才有的功能，Free 实例用不了，也没法直接查看容器里的文件。不需要它——直接在 **Supabase 的 SQL Editor**（Supabase 自带的免费功能，跟 Render 套餐无关）里把配置写进 `config_store` 表，CPA 下次读库时会自动用这份内容。
 
-```yaml
-remote-management:
-  allow-remote: true # 浏览器从公网访问管理面板，必须开
-  secret-key: '一个足够长的随机字符串' # 这就是 CPA Management Key
-  disable-control-panel: false
-  disable-auto-update-panel: false
-  panel-github-repository: 'https://github.com/seakee/CPA-Manager-Plus'
+CPA 首次成功连上 Postgres 时就会建好 `config_store` / `auth_store` / `cooldown_store` 这几张表（哪怕当时用的是默认模板配置），所以先完成第二步、确认 Logs 里 CPA 正常启动过一次，再做下面这步。
 
-api-keys:
-  - 'sk-你自己生成的客户端 Key'
-```
+1. 生成两串随机字符串，一串当 `secret-key`（登录面板用），一串当 `api-keys`（客户端连 CPA 用）：
 
-保存后重启服务。CPA 保存配置时会通过内置的文件监听把改动同步回 Supabase；如果重启后发现改动"丢了"（又变回了默认模板），说明这次同步没有生效，需要在 Shell 里再编辑一次并确认保存后日志里没有报错，必要时参考 CLIProxyAPI 自己的文档确认 `PGSTORE` 的同步时机（这是 CPA 项目自己实现的行为，不由 CPAMP 维护）。
+   ```bash
+   openssl rand -hex 32
+   ```
+
+2. Supabase Dashboard -> **SQL Editor** -> New query，粘贴（把两处 `换成...` 替换成上一步生成的值）：
+
+   ```sql
+   INSERT INTO config_store (id, content, created_at, updated_at)
+   VALUES (
+     'config',
+     $cfg$
+   host: ""
+   port: 8317
+   auth-dir: "~/.cli-proxy-api"
+   debug: false
+
+   remote-management:
+     allow-remote: true
+     secret-key: "换成你生成的第一串随机字符串"
+     disable-control-panel: false
+     disable-auto-update-panel: false
+     panel-github-repository: "https://github.com/seakee/CPA-Manager-Plus"
+
+   usage-statistics-enabled: false
+
+   api-keys:
+     - "sk-换成你生成的第二串随机字符串"
+   $cfg$,
+     NOW(),
+     NOW()
+   )
+   ON CONFLICT (id) DO UPDATE SET content = EXCLUDED.content, updated_at = NOW();
+   ```
+
+   `id` 固定用 `'config'`——这跟 CPA 自己读写这一行时用的主键一致。`$cfg$ ... $cfg$` 是 Postgres 的美元引号写法，把整段 YAML 当字符串包起来，不用管里面有没有引号或冒号。这条 `INSERT ... ON CONFLICT DO UPDATE` 和 CPA 自己写库时用的语句完全一样，所以之后 CPA 自己保存配置时会正常覆盖它，不会冲突。
+
+   如果报 `relation "config_store" does not exist`，说明 CPA 还没成功连过库、没建表：回 Render 检查 `PGSTORE_DSN` 和 Logs，确认至少成功启动过一次，再重跑这条 SQL。
+
+3. 执行后可以用下面这条确认写成功了：
+
+   ```sql
+   select id, left(content, 50), updated_at from config_store;
+   ```
+
+4. 回 Render 该服务页面，**Manual Deploy -> Restart service**（这是基础重启按钮，免费实例也能用，跟 Shell 是两回事）。CPA 重启时发现 `config_store` 里已经有 `config` 这一行，会直接读取这份内容生效。
 
 不需要开启 `usage-statistics-enabled`：轻量面板不消费用量队列，开不开都不影响面板功能。
 
@@ -101,7 +137,8 @@ Render 只把 CPA 的 `8317` 端口暴露到公网；CPA 在登录流程中用�
 
 ## 常见问题
 
+- **Logs 里报 `failed to bootstrap postgres-backed config` / `prepared statement "stmtcache_..." already exists (SQLSTATE 42P05)`** — 说明 `PGSTORE_DSN` 用的是 Supabase 的 **Transaction** 连接池模式，跟驱动的预编译语句缓存不兼容。回 Supabase 把连接池模式换成 **Session**，更新 Render 的 `PGSTORE_DSN` 环境变量并重启服务，见[第一步](#第一步-创建-supabase-postgres)。这个报错发生在读库阶段，不会破坏你已经写进 `config_store` 的配置。
 - **面板打不开** — 确认 `secret-key` 非空、`disable-control-panel: false`，并且服务确实已经重启过、日志里没有配置解析错误。
-- **连接 Supabase 失败 / 启动报数据库错误** — 确认 `PGSTORE_DSN` 用的是连接池地址（端口 `6543`）而不是直连地址、密码正确、Supabase 项目没有处于 Paused 状态。
-- **编辑 config.yaml 后重启，改动又变回默认值** — 说明这次编辑没有成功同步回 Supabase，参考[第三步](#第三步-配置-config-yaml)重新确认。
+- **连接 Supabase 失败 / 启动报数据库错误（非上面那条 42P05）** — 确认 `PGSTORE_DSN` 密码正确、Supabase 项目没有处于 Paused 状态。
+- **`config_store` 表里内容一直是默认模板，没有变成你写的值** — 确认[第三步](#第三步-配置-config-yaml)里的 SQL 真的执行成功了（用 `select` 语句确认），并且是在 Render 重启 *之后* 检查（重启前本来就该是你刚写的内容，重启后才会变成 CPA 读回来又原样写回的状态）。
 - **仍显示官方面板而不是 CPAMP 界面** — 检查 `panel-github-repository` 拼写，并确认 CPA 能访问 GitHub Release。

@@ -16,8 +16,11 @@
 #   runtime / image / envVars 等字段名；如有出入，优先用 Render Dashboard
 #   手动创建一个 Web Service，字段含义不会变。
 # - PGSTORE_DSN 必须手动在 Render Dashboard 里填写（Supabase 项目的 Postgres
-#   连接串，推荐用 Supabase 的 "Transaction pooler" 连接串，而不是直连），
-#   不要把它明文写进这个仓库或提交到 Git。
+#   连接串），不要把它明文写进这个仓库或提交到 Git。必须用 Supabase 的
+#   "Session" 连接池模式，不要用 "Transaction" 模式：CPA 的 Postgres 驱动
+#   会缓存预编译语句，Transaction 模式的连接池会把请求路由到不同的后端
+#   连接上，导致启动报 `prepared statement "stmtcache_..." already exists
+#   (SQLSTATE 42P05)` 而失败。
 # - region 默认写的 singapore，按你自己的用户所在地调整
 #   （oregon / ohio / virginia / frankfurt / singapore）。
 # - 完整部署步骤、config.yaml 示例、Supabase 建库步骤见
@@ -47,11 +50,13 @@ services:
       # - key: PGSTORE_SCHEMA
       #   value: cpa
     # 首次部署后没有 config.yaml 也没关系：CPA 会用内置的
-    # config.example.yaml 作为模板，把初始配置写进 Supabase。之后打开
-    # Render 的 Shell，编辑本地镜像出来的 config.yaml（保存后会自动同步回
-    # Supabase），至少设置：
+    # config.example.yaml 作为模板，把初始配置写进 Supabase。Render Free
+    # 实例没有交互式 Shell，不需要它——改用 Supabase 的 SQL Editor 直接写
+    # config_store 表（id 固定是 'config'），写完后重启这个服务生效。
+    # 至少要设置：
     #   remote-management.secret-key / allow-remote: true /
     #   disable-control-panel: false /
     #   panel-github-repository: https://github.com/seakee/CPA-Manager-Plus
     #   usage-statistics-enabled 不需要开（轻量面板不消费用量队列）
     #   api-keys: 给真实客户端用的 Key
+    # 完整 SQL 和步骤见 apps/docs/deployment/render.md 第三步。
