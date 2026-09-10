@@ -1,136 +1,107 @@
-# Render 部署
+# Render 部署（免费方案：CPA + Supabase + 轻量面板）
 
-Render 是托管式容器平台，可以直接从 Docker 镜像或本仓库的 Dockerfile 部署服务。本页说明如何把 **CPA（CLIProxyAPI 本体）** 和 **CPAMP 完整模式（Manager Server）** 都部署到 Render，并让二者正常连接。
+本页说明如何把 **CPA（CLIProxyAPI 本体）** 部署到 Render 的 **Free 实例**，并使用免费的 **Supabase Postgres** 做持久化，完全不需要 Render 的付费 Disk。管理界面用 CPAMP **轻量面板**（由 CPA 直接托管，不需要额外的 Manager Server 服务）。
 
-如果只是想先了解两种模式的区别，看[如何选择 CPA 面板](../guide/choosing-a-panel.md)；如果不需要在 Render 上跑 CPA 本体（已有别处运行的 CPA），可以跳过第一步，只做第二步。
+如果你需要请求历史、用量成本分析或账号自动化，这些能力只有 CPAMP **完整模式**（Manager Server）才有，而完整模式的 SQLite 存储没有对应的免费托管方案，需要 Render 付费 Disk，见 [Docker 部署](./docker.md)。本页只覆盖免费方案，也就是 CPA 本体 + 轻量面板。
 
-## 部署前必读
+## 为什么这样搭配
 
-- **两个服务都必须用支持 Disk 的付费实例**（Starter 及以上）。Render Free 实例既没有持久 Disk，空闲一段时间还会自动休眠；CPA 需要持久化 `config.yaml` 和账号认证文件，CPAMP 需要持久化 SQLite 和 `data.key`，缺一不可。
-- 每个 Render 服务只能挂一个 Disk，且只支持单实例（不能自动扩缩容）——这正好符合 CPA 和 CPAMP 都要求单实例运行的前提，不算额外限制。
-- Render 对外只通过 HTTPS 网关转发流量，不支持在公网地址上使用 RESP 需要的裸 TCP 协议，因此 CPAMP 的用量采集要显式设成 HTTP 队列模式（`USAGE_COLLECTOR_MODE=http`）。
-- 官方 CPA 镜像 `eceasy/cli-proxy-api` 默认不包含 `config.yaml`（只打包了 `config.example.yaml`），需要在启动时生成并持久化这个文件。
-- OAuth 登录在 Render 上只能走"远程浏览器回调"（手动粘贴回调 URL）：CPA 用来接收 OAuth 回调的额外端口（如 `8085` / `1455` / `54545` / `51121` / `11451`）不会公开，也不需要公开。
+- CPA 自带一个可插拔的远程存储后端（`PGSTORE_DSN`），设置后会把 `config.yaml` 全文和账号认证 token 都存进 Postgres，容器本地磁盘只是一份可丢弃的缓存，重启时自动从数据库回填。这正好匹配 Render Free 实例"没有持久 Disk、随时可能重建文件系统"的特点，不需要改任何代码。
+- CPAMP 轻量面板不需要独立服务、数据库或额外端口，只是让 CPA 托管一份不同的管理界面，天然免费。
+
+代价：轻量面板没有持久化的请求历史、成本分析和服务端自动化；Free 实例空闲会休眠，冷启动有延迟。这些限制见下面的[已知限制](#免费方案的已知限制)。
 
 ## 架构总览
 
+只有一个 Render 服务：
+
 | 服务 | 作用 | 端口 | 来源 |
 | --- | --- | --- | --- |
-| `cli-proxy-api`（CPA 本体） | 网关本体，接收并转发真实模型请求，Codex / Claude Code / OpenCode 等客户端直接连接这里 | `8317` | Docker 镜像 `eceasy/cli-proxy-api:latest` |
-| `cpa-manager-plus`（CPAMP 完整模式） | Manager Server，负责请求历史、用量分析、账号健康和自动化 | `18317` | 本仓库 `Dockerfile.manager-server` 构建 |
+| `cli-proxy-api` | 网关本体 + 轻量管理面板，客户端和管理员都直接连它 | `8317` | Docker 镜像 `eceasy/cli-proxy-api:latest` |
 
-如果想用 Blueprint 一次性创建两个服务，可以直接使用仓库根目录的 [`render.yaml`](https://github.com/seakee/CPA-Manager-Plus/blob/main/render.yaml)（Render Dashboard -> New -> Blueprint，选择本仓库）。字段名请对照 Render 当前文档核对；如果 Blueprint 部署失败，按下面的步骤手动创建两个 Web Service，效果完全一样。
+持久化：Supabase Postgres（`config.yaml` + 账号认证 token）。
 
-## 第一步：部署 CPA 本体
+仓库根目录的 [`render.yaml`](https://github.com/seakee/CPA-Manager-Plus/blob/main/render.yaml) 就是按这个方案写的 Blueprint，可以直接用 Render Dashboard -> New -> Blueprint 一键创建；字段名请对照 Render 当前文档核对，跑不通就照着下面的步骤手动建服务。
 
-1. Render Dashboard -> **New** -> **Web Service** -> 选择 "Existing Image"（部署已有镜像），填入：
+## 第一步：创建 Supabase Postgres
+
+1. 在 [Supabase](https://supabase.com/) 创建一个免费项目。
+2. 进入 Project Settings -> Database -> **Connection pooling**，选择 **Transaction** 模式，复制连接串（形如 `postgresql://postgres.xxxx:[YOUR-PASSWORD]@aws-xxx.pooler.supabase.com:6543/postgres`）。
+
+   推荐用连接池（端口通常是 `6543`）而不是直连（端口 `5432`）：Render Free 实例反复冷启动、反复建立新连接，连接池能避免占满 Supabase 免费项目有限的连接数。
+3. 把 `[YOUR-PASSWORD]` 替换成你在创建项目时设置的数据库密码，得到完整 DSN，先记下来（下一步要填进 Render）。
+
+## 第二步：把 CPA 部署到 Render
+
+1. Render Dashboard -> **New** -> **Web Service** -> 选择 "Existing Image"，填入：
 
    ```text
    docker.io/eceasy/cli-proxy-api:latest
    ```
 
-2. Instance Type 选 **Starter 及以上**（需要 Disk）。
-3. 添加 Disk：Mount Path 填 `/data`，大小从 1–2GB 起步即可（主要是认证文件和配置，体积很小）。
-4. 覆盖启动命令（Docker Command）。因为 Disk 只能挂一个路径，而 CPA 需要 `config.yaml` 和认证目录两处持久化，所以用一段脚本把 `/data` 下的文件软链到镜像期望的路径：
+2. Instance Type 选 **Free**（本方案不需要 Disk）。
+3. 环境变量：
 
-   ```sh
-   sh -c '
-   mkdir -p /data/auths &&
-   if [ ! -f /data/config.yaml ]; then cp /CLIProxyAPI/config.example.yaml /data/config.yaml; fi &&
-   ln -sfn /data/config.yaml /CLIProxyAPI/config.yaml &&
-   rm -rf /root/.cli-proxy-api &&
-   ln -sfn /data/auths /root/.cli-proxy-api &&
-   exec ./CLIProxyAPI
-   '
-   ```
+   | Key | 值 |
+   | --- | --- |
+   | `PORT` | `8317`（告诉 Render 转发到哪个端口；CPA 本身不读取这个变量） |
+   | `PGSTORE_DSN` | 第一步拿到的 Supabase 连接串 |
+   | `TZ` | 可选，例如 `Asia/Shanghai` |
 
-5. 环境变量加一条 `PORT=8317`，告诉 Render 把公网流量转发到容器的 `8317` 端口（CPA 本身不读取 `PORT`，这只是 Render 路由用的）。
-6. 部署完成后打开 Render 分配的地址（例如 `https://cli-proxy-api-xxxx.onrender.com`），查看 Logs 确认没有配置报错。
-7. 打开该服务的 **Shell** 标签，编辑 `/data/config.yaml`，至少配置：
+4. 部署完成后打开 Render 分配的地址（例如 `https://cli-proxy-api-xxxx.onrender.com`），查看 Logs：应该能看到 CPA 启动，并且没有连接 Postgres 失败的报错。
 
-   ```yaml
-   remote-management:
-     secret-key: '一个足够长的随机字符串' # 这就是 CPA Management Key
-     allow-remote: true
+首次启动时，Postgres 里还没有任何配置，CPA 会用内置的 `config.example.yaml` 作为模板，生成一份默认配置并写进 Supabase；之后每次冷启动都会从 Supabase 回填这份配置，不再依赖 Render 容器本地磁盘。
 
-   usage-statistics-enabled: true
-   redis-usage-queue-retention-seconds: 60
+## 第三步：配置 config.yaml
 
-   api-keys:
-     - 'sk-你自己生成的客户端 Key'
-   ```
+打开该服务的 **Shell** 标签，编辑本地镜像出来的配置文件（路径见镜像里的 `config.yaml`，通常在 `/CLIProxyAPI/config.yaml`），至少设置：
 
-   保存后重启服务。CPA 启动时会把明文 `secret-key` 自动改写成 bcrypt hash 并写回 `config.yaml`，所以这个文件必须保持可写——挂在 Disk 上正好满足这一点。
+```yaml
+remote-management:
+  allow-remote: true # 浏览器从公网访问管理面板，必须开
+  secret-key: '一个足够长的随机字符串' # 这就是 CPA Management Key
+  disable-control-panel: false
+  disable-auto-update-panel: false
+  panel-github-repository: 'https://github.com/seakee/CPA-Manager-Plus'
 
-8. 需要登录 Codex / Claude / Gemini 等 Provider 账号时，参考下面的 [OAuth 远程登录](#oauth-远程登录)。
-
-## 第二步：部署 CPAMP 完整模式
-
-1. Render Dashboard -> **New** -> **Web Service** -> 连接本仓库。
-2. Runtime 选 **Docker**，Dockerfile Path 填 `Dockerfile.manager-server`，Docker Context 填仓库根目录 `.`。
-3. Instance Type 选 **Starter 及以上**。
-4. 添加 Disk：Mount Path 填 `/data`，大小建议从 5–10GB 起步（SQLite 会随请求历史增长，具体看请求量和历史保留时长）。
-5. 环境变量：
-
-   | Key | 建议值 | 说明 |
-   | --- | --- | --- |
-   | `PORT` | `18317` | 告诉 Render 转发到哪个端口 |
-   | `HTTP_ADDR` | `0.0.0.0:18317` | Manager Server 监听地址 |
-   | `USAGE_DB_PATH` | `/data/usage.sqlite` | SQLite 路径 |
-   | `CPA_MANAGER_DATA_KEY_PATH` | `/data/data.key` | 数据加密 key 路径 |
-   | `CPA_MANAGER_ADMIN_KEY` | 一串长随机字符串 | 显式设置，避免每次重启翻日志找生成的临时 key |
-   | `USAGE_COLLECTOR_MODE` | `http` | Render 公网入口不支持 RESP 需要的裸 TCP |
-   | `USAGE_BATCH_SIZE` | `100` | 单批最大采集记录数 |
-   | `USAGE_POLL_INTERVAL_MS` | `500` | 空闲轮询间隔 |
-   | `USAGE_QUERY_LIMIT` | `50000` | 最近用量事件返回上限 |
-   | `USAGE_CORS_ORIGINS` | `*` 或你自己的域名 | 跨域来源 |
-
-6. Health Check Path 填 `/health`。
-7. 部署完成后打开：
-
-   ```text
-   https://<你的 CPAMP 服务>.onrender.com/management.html
-   ```
-
-   如果没有显式设置 `CPA_MANAGER_ADMIN_KEY`，去 Render Dashboard 的 Logs 里找启动时打印的一次性管理员密钥。
-8. 首次 setup 填写：
-   - **管理员密钥**：上一步取得的 key（或你在环境变量里设置的值）。
-   - **CPA URL**：CPA 服务的 Render 公网地址，例如 `https://cli-proxy-api-xxxx.onrender.com`。
-   - **CPA Management Key**：就是第一步 `config.yaml` 里 `remote-management.secret-key` 的明文（保存前的原始值）。
-
-## 同区域内网连接（可选）
-
-如果 CPA 和 CPAMP 部署在 **同一个 Render Region**，理论上可以让 CPAMP 通过 Render 私有网络直接访问 CPA，不必绕公网：
-
-```text
-http://<CPA 服务的 Render Name>:8317
+api-keys:
+  - 'sk-你自己生成的客户端 Key'
 ```
 
-这样做的前提和限制：
+保存后重启服务。CPA 保存配置时会通过内置的文件监听把改动同步回 Supabase；如果重启后发现改动"丢了"（又变回了默认模板），说明这次同步没有生效，需要在 Shell 里再编辑一次并确认保存后日志里没有报错，必要时参考 CLIProxyAPI 自己的文档确认 `PGSTORE` 的同步时机（这是 CPA 项目自己实现的行为，不由 CPAMP 维护）。
 
-- 两个服务必须在同一个 Region，否则内网地址不可达。
-- Render 私网是否原样透传 RESP 采集需要的裸 TCP 协议，请以 Render 当前文档或客服支持为准——不确定就继续用 `USAGE_COLLECTOR_MODE=http` 并走公网 HTTPS 地址，最稳妥，性能损失也可以忽略。
-- 无论内网还是公网连接，CPA 本身仍然需要公开的 HTTPS 地址供 Codex / Claude Code 等客户端直接调用，所以这一步只是给 CPAMP 到 CPA 的管理流量做一个可选优化，不能替代 CPA 的公网入口。
+不需要开启 `usage-statistics-enabled`：轻量面板不消费用量队列，开不开都不影响面板功能。
+
+## 第四步：打开轻量面板
+
+```text
+https://<你的 CPA 服务>.onrender.com/management.html
+```
+
+用上一步设置的 CPA Management Key 登录。首次访问时 CPA 会从 `panel-github-repository` 指定的仓库的最新 Release 里拉取 `management.html` 并缓存，需要能访问 GitHub。
+
+确认可以正常看到 Dashboard、配置中心、Provider、凭证管理、OAuth 和日志。
 
 ## OAuth 远程登录
 
 Render 只把 CPA 的 `8317` 端口暴露到公网；CPA 在登录流程中用来接收各家 Provider OAuth 回调的额外端口（`8085` / `1455` / `54545` / `51121` / `11451` 等）不会公开，也不需要公开：
 
-1. 在 CPAMP 完整模式的 OAuth 登录页面发起登录。
+1. 在轻量面板的 OAuth 登录页面发起登录。
 2. 在 Provider 完成授权后，浏览器会尝试跳转到 `http://localhost:<port>/...`，这一步必然会失败——这个端口只存在于 Render 容器内部，你的浏览器访问不到。
-3. 复制浏览器地址栏里 **完整** 的回调 URL，粘贴进 CPAMP 页面的回调 URL 输入框并提交，即可完成登录。
+3. 复制浏览器地址栏里 **完整** 的回调 URL，粘贴进面板的回调 URL 输入框并提交，即可完成登录。
 
 详见 [OAuth 登录](../manual/oauth.md)。Vertex 服务账号导入不走浏览器回调，不受影响。
 
-## 备份
+## 免费方案的已知限制
 
-- **CPA**：定期通过 Render 的 Shell 把 `/data/config.yaml` 和 `/data/auths` 打包，上传到你自己的对象存储；Render 目前没有内建的 Disk 快照/一键下载功能。
-- **CPAMP**：备份 `/data/usage.sqlite*` 和 `/data/data.key`，方法和 [备份与恢复](../operations/backup.md) 一致，只是执行位置换成 Render 的 Shell。`data.key` 丢失会导致已保存的 CPA Management Key 无法恢复，只能重新在面板里保存一次 CPA 连接。
+- **Free 实例会休眠**：长时间没有请求后 Render 会让容器休眠，下一次请求需要冷启动（重新拉起容器 + 从 Supabase 回填配置），会有几秒到十几秒的延迟。如果对客户端首次请求的延迟敏感，需要升级到付费实例。
+- **Supabase 免费项目也会暂停**：长时间（Supabase 目前是 7 天）没有任何数据库活动，免费项目会自动暂停，下次连接会失败，需要去 Supabase Dashboard 手动 Resume 项目。如果 CPA 本身也经常没人访问，两边的休眠/暂停可能叠加，第一次请求失败是预期行为，重试或先手动唤醒 Supabase 项目即可。
+- **Render 的免费额度有限制**（实例数量、每月运行时长等），具体以 Render 当前的定价页面为准，这里不写死数字以免过时。
+- **轻量面板没有请求历史 / 成本分析 / 账号自动化**，这是它的设计目标，不是 bug。需要这些能力时再考虑 CPAMP 完整模式（[Docker 部署](./docker.md)），但那需要 Render 付费 Disk（本仓库的 SQLite 存储没有免费托管方案）。
 
 ## 常见问题
 
-- **服务几分钟不用就打不开 / 冷启动很慢** — 说明用了 Free 实例。Free 实例空闲会休眠且没有 Disk，两个服务都至少要用 Starter。
-- **CPAMP 一直显示未连接 CPA** — 确认 CPA URL 填的是完整 HTTPS 地址（带 `https://`），CPA 服务的 Logs 里没有报错，并且 `remote-management.allow-remote: true` 已经生效并重启过。
-- **请求监控没有数据** — 确认 CPA 的 `usage-statistics-enabled: true` 已保存，CPAMP 的 `USAGE_COLLECTOR_MODE=http`，再参考[请求监控排障](../troubleshooting/request-monitoring.md)。
-- **重启后 CPA 认证信息或 CPAMP 历史数据丢失** — 确认对应服务确实挂了 Disk，并且启动命令 / 环境变量把数据写到了 Disk 的挂载路径下（`/data`），而不是容器里其他会被重建的临时目录。
-- **看到 `unsupported RESP prefix 'H'`** — 说明采集器仍在尝试 RESP 模式，请确认 `USAGE_COLLECTOR_MODE` 已经改成 `http` 并重新部署。
+- **面板打不开** — 确认 `secret-key` 非空、`disable-control-panel: false`，并且服务确实已经重启过、日志里没有配置解析错误。
+- **连接 Supabase 失败 / 启动报数据库错误** — 确认 `PGSTORE_DSN` 用的是连接池地址（端口 `6543`）而不是直连地址、密码正确、Supabase 项目没有处于 Paused 状态。
+- **编辑 config.yaml 后重启，改动又变回默认值** — 说明这次编辑没有成功同步回 Supabase，参考[第三步](#第三步-配置-config-yaml)重新确认。
+- **仍显示官方面板而不是 CPAMP 界面** — 检查 `panel-github-repository` 拼写，并确认 CPA 能访问 GitHub Release。

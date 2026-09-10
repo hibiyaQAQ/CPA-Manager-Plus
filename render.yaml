@@ -1,87 +1,57 @@
-# Render Blueprint: CPA (CLIProxyAPI 本体) + CPAMP 完整模式 (Manager Server)
+# Render Blueprint: CPA (CLIProxyAPI 本体) 独立部署，完全免费方案
+#
+# 架构：只部署 CPA 一个服务，用 CPA 自带的 PGSTORE（Postgres 远程存储）把
+# config.yaml 和账号认证 token 存进 Supabase 免费 Postgres，本地磁盘只是
+# 一次性/可丢弃的缓存——因此不需要 Render 的付费 Disk，可以用 Free 实例。
+#
+# 面板用的是 CPAMP“轻量面板”：不部署 Manager Server / CPAMP 容器，只在
+# CPA 的 config.yaml 里设置 panel-github-repository，由 CPA 直接在
+# :8317/management.html 托管管理界面。没有请求历史、用量分析和账号自动化，
+# 只做 Provider / 凭证 / OAuth / 日志 / 插件这些日常管理。
+# 如果以后想要完整模式，需要另外部署 CPAMP Manager Server 并挂一个付费
+# Disk（本仓库的 SQLite 存储没有等价的免费方案），不在本文件范围内。
 #
 # 使用前必读：
-# - CPA 和 CPAMP 都需要持久化数据，Render 的 Disk 只在付费实例（Starter 及以上）可用，
-#   Free 实例既没有 Disk 也会空闲休眠，不适合部署这两个服务。
-# - Render 的 Blueprint 字段会随产品迭代变化，本文件按 Render 公开文档描述的字段编写，
-#   部署前请对照 Render 当前的 Blueprint 文档（Dashboard -> Blueprints）核对
-#   runtime / image / disk 等字段名是否仍然一致；如有出入，优先使用 Render Dashboard
-#   手动创建两个 Web Service，字段含义不会变。
-# - region 默认写的 singapore，按你自己的用户所在地调整（oregon / ohio / virginia / frankfurt / singapore）。
-# - 完整部署步骤、config.yaml 示例、OAuth 远程登录说明见
+# - Render Blueprint 字段会随产品迭代变化，部署前请对照 Render 当前文档核对
+#   runtime / image / envVars 等字段名；如有出入，优先用 Render Dashboard
+#   手动创建一个 Web Service，字段含义不会变。
+# - PGSTORE_DSN 必须手动在 Render Dashboard 里填写（Supabase 项目的 Postgres
+#   连接串，推荐用 Supabase 的 "Transaction pooler" 连接串，而不是直连），
+#   不要把它明文写进这个仓库或提交到 Git。
+# - region 默认写的 singapore，按你自己的用户所在地调整
+#   （oregon / ohio / virginia / frankfurt / singapore）。
+# - 完整部署步骤、config.yaml 示例、Supabase 建库步骤见
 #   apps/docs/deployment/render.md（中文）或 apps/docs/en/deployment/render.md（English）。
 
 services:
-  # CPA / CLIProxyAPI 本体：真实模型网关，Codex / Claude Code 等客户端直接连接这里。
+  # CPA / CLIProxyAPI 本体：真实模型网关 + 轻量面板，
+  # Codex / Claude Code 等客户端和管理员浏览器都直接连接这里。
   - type: web
     name: cli-proxy-api
     runtime: image
     image:
       url: docker.io/eceasy/cli-proxy-api:latest
-    plan: starter
+    plan: free
     region: singapore
-    # 官方镜像不自带 config.yaml（只有 config.example.yaml），认证目录默认在
-    # /root/.cli-proxy-api。Render 每个服务只能挂一个 Disk，所以用启动命令把
-    # /data 下的文件/目录软链到镜像期望的路径，而不是直接把 Disk 挂到 /CLIProxyAPI
-    # （那样会盖住镜像里已经打包好的二进制文件）。
-    dockerCommand: >-
-      sh -c '
-      mkdir -p /data/auths &&
-      if [ ! -f /data/config.yaml ]; then cp /CLIProxyAPI/config.example.yaml /data/config.yaml; fi &&
-      ln -sfn /data/config.yaml /CLIProxyAPI/config.yaml &&
-      rm -rf /root/.cli-proxy-api &&
-      ln -sfn /data/auths /root/.cli-proxy-api &&
-      exec ./CLIProxyAPI
-      '
     envVars:
       - key: PORT
         value: '8317'
       - key: TZ
         value: Asia/Shanghai
-    disk:
-      name: cpa-data
-      mountPath: /data
-      sizeGB: 2
-    # 部署完成后需要通过 Render 的 Shell 手动编辑 /data/config.yaml，
-    # 至少设置 remote-management.secret-key / allow-remote、
-    # usage-statistics-enabled 和 api-keys，详见部署文档。
-
-  # CPAMP 完整模式：Manager Server，负责请求历史、用量分析、账号健康与自动化。
-  - type: web
-    name: cpa-manager-plus
-    runtime: docker
-    dockerfilePath: ./Dockerfile.manager-server
-    dockerContext: .
-    plan: starter
-    region: singapore
-    healthCheckPath: /health
-    envVars:
-      - key: PORT
-        value: '18317'
-      - key: HTTP_ADDR
-        value: 0.0.0.0:18317
-      - key: USAGE_DB_PATH
-        value: /data/usage.sqlite
-      - key: CPA_MANAGER_DATA_KEY_PATH
-        value: /data/data.key
-      - key: CPA_MANAGER_ADMIN_KEY
-        generateValue: true
-      # Render 公网入口只转发 HTTPS，不支持 RESP 采集需要的裸 TCP 协议，
-      # 因此强制走 HTTP 用量队列模式。
-      - key: USAGE_COLLECTOR_MODE
-        value: http
-      - key: USAGE_BATCH_SIZE
-        value: '100'
-      - key: USAGE_POLL_INTERVAL_MS
-        value: '500'
-      - key: USAGE_QUERY_LIMIT
-        value: '50000'
-      - key: USAGE_CORS_ORIGINS
-        value: '*'
-    disk:
-      name: cpamp-data
-      mountPath: /data
-      sizeGB: 5
-    # 首次登录用 CPA_MANAGER_ADMIN_KEY 生成的随机管理员密钥（也可在 Render Dashboard
-    # 环境变量里查看/覆盖），setup 时填写 CPA 的 Render 公网地址和 config.yaml 里的
-    # remote-management.secret-key。
+      # 必填：Supabase 项目的 Postgres 连接串（建议用 Transaction pooler，
+      # 端口通常是 6543，并带 ?sslmode=require）。sync: false 表示这个值
+      # 只能在 Render Dashboard 里手动填写，不会出现在这个文件里。
+      - key: PGSTORE_DSN
+        sync: false
+      # 可选：自定义 Postgres schema，不填则用 Supabase 默认的 public。
+      # - key: PGSTORE_SCHEMA
+      #   value: cpa
+    # 首次部署后没有 config.yaml 也没关系：CPA 会用内置的
+    # config.example.yaml 作为模板，把初始配置写进 Supabase。之后打开
+    # Render 的 Shell，编辑本地镜像出来的 config.yaml（保存后会自动同步回
+    # Supabase），至少设置：
+    #   remote-management.secret-key / allow-remote: true /
+    #   disable-control-panel: false /
+    #   panel-github-repository: https://github.com/seakee/CPA-Manager-Plus
+    #   usage-statistics-enabled 不需要开（轻量面板不消费用量队列）
+    #   api-keys: 给真实客户端用的 Key
